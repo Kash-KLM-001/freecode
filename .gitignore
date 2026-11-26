@@ -1,0 +1,27 @@
+# Build outputs
+/freecode
+/kmodels
+/freecode-asan
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+
+# Local config and secrets
+/config
+/config.*
+!/config.example
+*.key
+*.pem
+*.p12
+.env
+.env.*
+
+# Editor / OS / test artifacts
+*.swp
+*.swo
+*~
+.DS_Store
+*.tmp
+*.log

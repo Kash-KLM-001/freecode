@@ -1,0 +1,26 @@
+# freecode configuration example
+# Copy to $XDG_CONFIG_HOME/freecode/config (or ~/.config/freecode/config).
+# The saved file is written with mode 0600; keep API keys private.
+
+# kilo, local, openai, anthropic, or custom
+provider=kilo
+
+# Kilo free gateway default. Override for local/custom routes.
+base_url=https://ai-gateway.kilo.ai/api/v1
+
+# Leave empty for anonymous free tier; no Authorization header is sent.
+api_key=
+
+model=kilo-auto/free
+free_only=1
+stub=0
+
+# Warn at 70% context, compact at 88%.
+warn_pct=70
+compact_pct=88
+
+# 1-8 synchronized model slots.
+team_size=3
+
+# auto, curl, direct, or libcurl
+transport=auto
