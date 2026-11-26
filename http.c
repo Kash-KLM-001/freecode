@@ -193,7 +193,7 @@ static void child_direct(const HttpReq *req)
         has_header(headers, "transfer-encoding: chunked")) {
         size_t i = 0;
         while (i < raw.len - body_off) {
-            char *nl = memchr(body + i, '\n', raw.len - body_off - i);
+            const char *nl = memchr(body + i, '\n', raw.len - body_off - i);
             if (!nl) break;
             size_t linelen = (size_t)(nl - (body + i));
             char *size_line = xstrndup_n(body + i, linelen);

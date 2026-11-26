@@ -30,6 +30,34 @@ Clean:
 make clean
 ```
 
+## glibc and bionic
+
+The same source builds against **glibc** (Linux) and **bionic** (Android /
+Termux). The default build has no linked third-party dependencies, and the
+POSIX feature macros in the Makefile are honored by both libcs.
+
+```sh
+make            # host build: glibc on Linux, bionic on Android/Termux
+make bionic     # freecode-bionic, kmodels-bionic (BIONIC_CC overrides compiler)
+make glibc      # freecode-glibc, kmodels-glibc
+make both       # both at once
+./scripts/build-libcs.sh   # build both and show each ELF interpreter
+```
+
+`make glibc` uses the native glibc compiler when the host already has one. On
+a bionic host it cross-compiles with clang and the bundled glibc sysroot, by
+default `/data/data/com.termux/files/usr/glibc`. Override with
+`GLIBC_SYSROOT=/path`, `GLIBC_CC=clang`, `GLIBC_TRIPLE=aarch64-unknown-linux-gnu`,
+`GLIBC_CRT_DIR=/path/lib`, or `GLIBC_LD=lld` if your environment differs.
+
+`make bionic` uses `$(CC)` when it already targets Android. On a glibc host,
+pass an NDK clang wrapper, e.g.
+`make bionic BIONIC_CC=aarch64-linux-android24-clang`.
+
+The glibc build links `libm`; the bionic build does not need it. Neither build
+requires a system-wide libcurl (that remains the optional `make libcurl`
+target).
+
 ## Free model selector
 
 `scripts/select-free-model.sh` checks the live Kilo catalog and prints only
@@ -188,6 +216,7 @@ full frontend stack. Use `/threshold`, `/compact`, and `/rotate` to control it.
 - Local models, custom routes, provider API keys
 - Token/cost/rate usage tracking, auto-compaction, model rotation
 - Automatic persistent chat memory with restored agent context
+- Portable glibc and bionic builds with explicit `make` targets
 
 ## Scope
 

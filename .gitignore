@@ -1,6 +1,10 @@
 # Build outputs
 /freecode
 /kmodels
+/freecode-bionic
+/kmodels-bionic
+/freecode-glibc
+/kmodels-glibc
 /freecode-asan
 *.o
 *.a

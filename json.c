@@ -4,6 +4,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -142,8 +143,10 @@ static JVal *parse_number(Parser *p)
     char *tmp = xstrndup_n(p->p + start, p->pos - start);
     char *end = NULL;
     double d = strtod(tmp, &end);
+    /* glibc may recycle the freed chunk immediately; read *end first. */
+    int bad = end && *end;
     free(tmp);
-    if (end && *end) {
+    if (bad) {
         set_err(p, "bad number");
         return NULL;
     }
