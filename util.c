@@ -5,6 +5,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 void fc_die(const char *msg)
 {
@@ -99,6 +100,34 @@ char *buf_take(Buf *b)
     b->p = NULL;
     b->len = b->cap = 0;
     return p;
+}
+
+int fs_mkdir_parents(const char *path)
+{
+    char *copy = xstrdup(path ? path : "");
+    char *slash = strrchr(copy, '/');
+    if (!slash) {
+        free(copy);
+        return 0;
+    }
+    *slash = '\0';
+    char *dir = copy;
+    for (char *p = dir + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+                free(copy);
+                return -1;
+            }
+            *p = '/';
+        }
+    }
+    if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
+        free(copy);
+        return -1;
+    }
+    free(copy);
+    return 0;
 }
 
 char *str_trim(char *s)

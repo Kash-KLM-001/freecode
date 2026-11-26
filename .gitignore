@@ -8,10 +8,11 @@
 *.dylib
 *.exe
 
-# Local config and secrets
+# Local config, chat memory, and secrets
 /config
-/config.*
-!/config.example
+/config.local
+/config.test
+*.jsonl
 *.key
 *.pem
 *.p12

@@ -14,7 +14,9 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 #include <wchar.h>
 
@@ -51,6 +53,11 @@ static const char *const SGR[STYLE_COUNT] = {
 #define NO_SLOT ((size_t)-1)
 #define MAX_LOG_MSGS 600
 #define COMPACTION_KEEP 64
+
+/* Chat memory is written automatically; these track the pending save. */
+static int g_mem_dirty = 0;
+static time_t g_mem_last_save = 0;
+static char *g_mem_path = NULL;
 
 static char *preview_text(const char *s, size_t len, size_t max);
 
@@ -316,6 +323,7 @@ static void session_add(Session *s, const char *text, size_t len, uint8_t kind)
     memset(m, 0, sizeof(*m));
     m->kind = kind;
     msg_append(m, text, len);
+    g_mem_dirty = 1;
 }
 
 static void app_new_session(App *a)
@@ -329,6 +337,7 @@ static void app_new_session(App *a)
     s->title = xstrdup("untitled");
     a->cur = a->n++;
     a->scroll = 0;
+    g_mem_dirty = 1;
 }
 
 static void session_set_title(Session *s, const char *text, size_t len)
@@ -497,6 +506,302 @@ static const char *const FALLBACK_FREE[] = {
     "poolside/laguna-s-2.1:free"
 };
 
+/* ---------- automatic chat memory ---------- */
+
+static char *memory_default_path(void)
+{
+    const char *env = getenv("FREECODE_MEMORY_FILE");
+    if (env && *env) return xstrdup(env);
+    const char *state = getenv("XDG_STATE_HOME");
+    if (state && *state) {
+        size_t n = strlen(state) + strlen("/freecode/memory.jsonl") + 1;
+        char *p = xmalloc(n);
+        snprintf(p, n, "%s/freecode/memory.jsonl", state);
+        return p;
+    }
+    const char *home = getenv("HOME");
+    if (!home || !*home) home = ".";
+    size_t n = strlen(home) + strlen("/.local/state/freecode/memory.jsonl") + 1;
+    char *p = xmalloc(n);
+    snprintf(p, n, "%s/.local/state/freecode/memory.jsonl", home);
+    return p;
+}
+
+static void session_clear(Session *s)
+{
+    if (!s) return;
+    for (size_t i = 0; i < s->n; i++) free(s->v[i].text);
+    free(s->v);
+    free(s->title);
+    memset(s, 0, sizeof(*s));
+}
+
+static void app_clear(App *a)
+{
+    if (!a) return;
+    for (size_t i = 0; i < a->n; i++) session_clear(&a->v[i]);
+    free(a->v);
+    memset(a, 0, sizeof(*a));
+}
+
+static void team_clear_state(Team *t)
+{
+    if (!t) return;
+    for (size_t i = 0; i < t->n; i++) {
+        free(t->v[i].name);
+        free(t->v[i].role);
+        free(t->v[i].model);
+    }
+    free(t->v);
+    session_clear(&t->log);
+    free(t->summary);
+    memset(t, 0, sizeof(*t));
+}
+
+static void mem_add_slot(Team *t, const char *name, const char *role,
+                         const char *model, size_t seen)
+{
+    if (!t || !name || !*name) return;
+    t->v = xrealloc(t->v, (t->n + 1) * sizeof(ModelSlot));
+    ModelSlot *s = &t->v[t->n++];
+    memset(s, 0, sizeof(*s));
+    s->name = xstrdup(name);
+    s->role = xstrdup(role ? role : "worker");
+    s->model = xstrdup(model ? model : "kilo-auto/free");
+    s->seen = seen;
+}
+
+static void mem_write_messages(Buf *b, const Session *s)
+{
+    buf_putc(b, '[');
+    for (size_t i = 0; i < s->n; i++) {
+        if (i) buf_putc(b, ',');
+        char *text = json_quote(s->v[i].text ? s->v[i].text : "");
+        buf_fmt(b, "{\"kind\":%u,\"text\":%s}",
+                (unsigned int)(s->v[i].kind <= 2 ? s->v[i].kind : MSG_SYSTEM), text);
+        free(text);
+    }
+    buf_putc(b, ']');
+}
+
+static int memory_save_now(App *app, Team *t)
+{
+    if (!g_mem_path || !app || !t) return -1;
+    if (fs_mkdir_parents(g_mem_path) != 0) return -1;
+
+    size_t tmpcap = strlen(g_mem_path) + 8;
+    char *tmp = xmalloc(tmpcap);
+    snprintf(tmp, tmpcap, "%s.tmp", g_mem_path);
+
+    FILE *f = fopen(tmp, "wb");
+    if (!f) {
+        free(tmp);
+        return -1;
+    }
+    chmod(tmp, 0600);
+
+    Buf b = {0};
+    buf_fmt(&b, "{\"type\":\"meta\",\"version\":1,\"saved\":%ld,"
+                "\"cur_session\":%zu,\"focus\":%zu,\"broadcast\":%s}\n",
+            (long)time(NULL), app->cur, t->focus, t->broadcast ? "true" : "false");
+
+    buf_puts(&b, "{\"type\":\"team\",\"summary\":");
+    char *q = json_quote(t->summary ? t->summary : "");
+    buf_puts(&b, q);
+    free(q);
+    buf_puts(&b, ",\"messages\":");
+    mem_write_messages(&b, &t->log);
+    buf_puts(&b, ",\"slots\":[");
+    for (size_t i = 0; i < t->n; i++) {
+        if (i) buf_putc(&b, ',');
+        char *name = json_quote(t->v[i].name ? t->v[i].name : "");
+        char *role = json_quote(t->v[i].role ? t->v[i].role : "");
+        char *model = json_quote(t->v[i].model ? t->v[i].model : "");
+        buf_fmt(&b, "{\"name\":%s,\"role\":%s,\"model\":%s,\"seen\":%zu}",
+                name, role, model, t->v[i].seen);
+        free(name);
+        free(role);
+        free(model);
+    }
+    buf_puts(&b, "]}\n");
+
+    for (size_t i = 0; i < app->n; i++) {
+        buf_puts(&b, "{\"type\":\"session\",\"title\":");
+        q = json_quote(app->v[i].title ? app->v[i].title : "untitled");
+        buf_puts(&b, q);
+        free(q);
+        buf_puts(&b, ",\"messages\":");
+        mem_write_messages(&b, &app->v[i]);
+        buf_puts(&b, "}\n");
+    }
+
+    int rc = 0;
+    if (b.len && fwrite(b.p, 1, b.len, f) != b.len) rc = -1;
+    if (fflush(f) != 0) rc = -1;
+    if (fsync(fileno(f)) != 0 && errno != EINVAL) rc = -1;
+    if (fclose(f) != 0) rc = -1;
+    if (rc == 0 && rename(tmp, g_mem_path) != 0) rc = -1;
+    if (rc != 0) unlink(tmp);
+
+    buf_free(&b);
+    free(tmp);
+    return rc;
+}
+
+static void mem_read_messages(JVal *root, Session *s)
+{
+    size_t n = json_arr_len(root, "messages");
+    for (size_t i = 0; i < n; i++) {
+        JVal *item = json_arr_at(root, "messages", i);
+        const char *text = json_str(item, "text");
+        int kind = (int)json_num(item, "kind");
+        if (kind < 0 || kind > 2) kind = MSG_SYSTEM;
+        session_add(s, text ? text : "", text ? strlen(text) : 0, (uint8_t)kind);
+    }
+}
+
+static int memory_load(const char *path, App *app, Team *t)
+{
+    if (!path || !app || !t) return -1;
+    FILE *f = fopen(path, "rb");
+    if (!f) return 1;
+
+    Buf raw = {0};
+    char chunk[8192];
+    size_t n;
+    while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0) buf_add(&raw, chunk, n);
+    fclose(f);
+    if (!raw.len) {
+        buf_free(&raw);
+        return 1;
+    }
+
+    App loaded_app;
+    Team loaded_team;
+    memset(&loaded_app, 0, sizeof(loaded_app));
+    memset(&loaded_team, 0, sizeof(loaded_team));
+
+    int ok = 1;
+    char *p = raw.p;
+    char *end = raw.p + raw.len;
+    while (p < end && ok) {
+        char *nl = memchr(p, '\n', (size_t)(end - p));
+        char *line_end = nl ? nl : end;
+        size_t len = (size_t)(line_end - p);
+        if (len) {
+            char *line = xstrndup_n(p, len);
+            char *jerr = NULL;
+            JVal *root = json_parse(line, len, &jerr);
+            if (!root) {
+                free(jerr);
+                ok = 0;
+            } else {
+                const char *type = json_str(root, "type");
+                if (type && strcmp(type, "meta") == 0) {
+                    loaded_app.cur = (size_t)json_num(root, "cur_session");
+                    loaded_team.focus = (size_t)json_num(root, "focus");
+                    loaded_team.broadcast = json_bool(root, "broadcast");
+                } else if (type && strcmp(type, "team") == 0) {
+                    const char *summary = json_str(root, "summary");
+                    free(loaded_team.summary);
+                    loaded_team.summary = xstrdup(summary ? summary : "");
+                    mem_read_messages(root, &loaded_team.log);
+                    size_t ns = json_arr_len(root, "slots");
+                    for (size_t i = 0; i < ns; i++) {
+                        JVal *item = json_arr_at(root, "slots", i);
+                        size_t seen = (size_t)json_num(item, "seen");
+                        if (seen > loaded_team.log.n) seen = loaded_team.log.n;
+                        mem_add_slot(&loaded_team,
+                                     json_str(item, "name"),
+                                     json_str(item, "role"),
+                                     json_str(item, "model"), seen);
+                    }
+                } else if (type && strcmp(type, "session") == 0) {
+                    Session s;
+                    memset(&s, 0, sizeof(s));
+                    const char *title = json_str(root, "title");
+                    s.title = xstrdup(title ? title : "untitled");
+                    mem_read_messages(root, &s);
+                    loaded_app.v = xrealloc(loaded_app.v, (loaded_app.n + 1) * sizeof(Session));
+                    loaded_app.v[loaded_app.n++] = s;
+                }
+                json_free(root);
+            }
+            free(line);
+        }
+        p = nl ? nl + 1 : end;
+    }
+    buf_free(&raw);
+
+    if (!ok) {
+        app_clear(&loaded_app);
+        team_clear_state(&loaded_team);
+        return -1;
+    }
+
+    if (!loaded_app.n) app_new_session(&loaded_app);
+    if (!loaded_team.n) {
+        mem_add_slot(&loaded_team, "planner", "plan",
+                     g_cfg.model ? g_cfg.model : FALLBACK_FREE[0], 0);
+        loaded_team.broadcast = 1;
+    }
+    if (loaded_app.cur >= loaded_app.n) loaded_app.cur = loaded_app.n - 1;
+    if (loaded_team.focus >= loaded_team.n) loaded_team.focus = loaded_team.n - 1;
+    loaded_app.scroll = 0;
+    loaded_team.scroll = 0;
+
+    app_clear(app);
+    team_clear_state(t);
+    *app = loaded_app;
+    *t = loaded_team;
+    return 0;
+}
+
+static void memory_save_if_dirty(App *app, Team *t, int force)
+{
+    if (!g_mem_dirty) return;
+    if (!force && g_mem_last_save && time(NULL) - g_mem_last_save < 2) return;
+    if (memory_save_now(app, t) == 0) {
+        g_mem_dirty = 0;
+        g_mem_last_save = time(NULL);
+    }
+}
+
+static void memory_clear(App *app, Team *t)
+{
+    if (g_mem_path) {
+        unlink(g_mem_path);
+        size_t n = strlen(g_mem_path) + 8;
+        char *tmp = xmalloc(n);
+        snprintf(tmp, n, "%s.tmp", g_mem_path);
+        unlink(tmp);
+        free(tmp);
+    }
+
+    app_clear(app);
+    app_new_session(app);
+    Session *s = &app->v[0];
+    static const char welcome[] = "freecode: fresh chat memory started.";
+    session_add(s, welcome, sizeof(welcome) - 1, MSG_SYSTEM);
+    free(s->title);
+    s->title = xstrdup("freecode");
+
+    team_clear_state(t);
+    static const char *const roles[] = {
+        "plan", "review", "critic", "worker", "worker", "worker", "worker", "worker"
+    };
+    for (int i = 0; i < g_cfg.team_size; i++) {
+        char name[32];
+        snprintf(name, sizeof(name), i == 0 ? "planner" : i == 1 ? "reviewer" : "m%d", i + 1);
+        const char *model = i == 0 && g_cfg.model && *g_cfg.model
+            ? g_cfg.model : FALLBACK_FREE[(size_t)i % (sizeof(FALLBACK_FREE) / sizeof(FALLBACK_FREE[0]))];
+        mem_add_slot(t, name, roles[i], model, 0);
+    }
+    t->focus = 0;
+    t->broadcast = 1;
+    g_mem_dirty = 1;
+}
+
 static void pool_init(void)
 {
     memset(&g_pool, 0, sizeof(g_pool));
@@ -589,6 +894,7 @@ static void team_add_slot(Team *t, const char *name, const char *role, const cha
     s->seen = t->log.n;
     if (t->n == 0) t->focus = 0;
     t->n++;
+    g_mem_dirty = 1;
 }
 
 static void team_remove_slot(Team *t, const char *name)
@@ -602,6 +908,7 @@ static void team_remove_slot(Team *t, const char *name)
     t->n--;
     if (t->n == 0) t->focus = 0;
     else if (t->focus >= t->n) t->focus = t->n - 1;
+    g_mem_dirty = 1;
 }
 
 static void team_log_sys(Team *t, const char *msg)
@@ -615,7 +922,7 @@ static void team_init(void)
 {
     memset(&g_team, 0, sizeof(g_team));
     static const char welcome[] =
-        "Kilo free gateway team: no account, no API key, no paid models. All slots share one synchronized log.";
+        "Kilo free gateway team: no account, no API key, no paid models. All slots share one synchronized log. Chat memory is saved automatically.";
     session_add(&g_team.log, welcome, sizeof(welcome) - 1, MSG_SYSTEM);
     static const char *const roles[] = {"plan", "review", "critic", "worker", "worker", "worker", "worker", "worker"};
     for (int i = 0; i < g_cfg.team_size; i++) {
@@ -631,16 +938,7 @@ static void team_init(void)
 
 static void team_cleanup(void)
 {
-    for (size_t i = 0; i < g_team.n; i++) {
-        free(g_team.v[i].name);
-        free(g_team.v[i].role);
-        free(g_team.v[i].model);
-    }
-    free(g_team.v);
-    for (size_t i = 0; i < g_team.log.n; i++) free(g_team.log.v[i].text);
-    free(g_team.log.v);
-    free(g_team.summary);
-    memset(&g_team, 0, sizeof(g_team));
+    team_clear_state(&g_team);
 }
 
 static void team_sync_all(Team *t)
@@ -700,6 +998,7 @@ static void rotate_models(int log_it)
         g_team.v[i].model = xstrdup(g_pool.candidates[(idx + 1 + i) % g_pool.ncandidates]);
     }
     provider_set_model(&g_provider, g_team.v[g_team.focus].model);
+    g_mem_dirty = 1;
     if (log_it) team_log_sys(&g_team, "models rotated after compaction/error");
 }
 
@@ -999,6 +1298,7 @@ static void run_finish_job(void)
         }
     }
     free(err);
+    g_mem_dirty = 1;
 
     size_t prompt = r->parser.prompt_tokens ? r->parser.prompt_tokens : r->prompt_est;
     size_t completion = r->parser.completion_tokens ? r->parser.completion_tokens
@@ -1038,6 +1338,7 @@ static void run_tick(void)
         size_t step = 2;
         if (r->stub_pos + step > r->stub_total) step = r->stub_total - r->stub_pos;
         msg_append(&g_team.log.v[r->message], r->stub_target + r->stub_pos, step);
+        g_mem_dirty = 1;
         r->stub_pos += step;
         if (r->stub_pos >= r->stub_total) run_finish_job();
         return;
@@ -1048,15 +1349,19 @@ static void run_tick(void)
     if (n > 0) chat_parser_feed(&r->parser, buf, (size_t)n);
     char *delta = chat_parser_take(&r->parser);
     if (delta) {
-        if (r->message < g_team.log.n)
+        if (r->message < g_team.log.n) {
             msg_append(&g_team.log.v[r->message], delta, strlen(delta));
+            g_mem_dirty = 1;
+        }
         free(delta);
     }
     if (n < 0 || http_stream_eof(r->req)) {
         char *tail = chat_parser_take(&r->parser);
         if (tail) {
-            if (r->message < g_team.log.n)
+            if (r->message < g_team.log.n) {
                 msg_append(&g_team.log.v[r->message], tail, strlen(tail));
+                g_mem_dirty = 1;
+            }
             free(tail);
         }
         run_finish_job();
@@ -1094,6 +1399,7 @@ static void stream_tick(App *a, Stream *st)
     size_t step = 2;
     if (st->pos + step > st->total) step = st->total - st->pos;
     msg_append(m, st->target + st->pos, step);
+    g_mem_dirty = 1;
     st->pos += step;
     if (st->pos >= st->total) st->active = 0;
 }
@@ -1103,7 +1409,8 @@ static void stream_tick(App *a, Stream *st)
 static const char *const PALETTE_ITEMS[] = {
     "New session", "Next session", "Clear prompt", "Force redraw",
     "Toggle team view", "Toggle broadcast", "Discover free models",
-    "Compact now", "Show usage", "Save config", "Quit"
+    "Compact now", "Show usage", "Save config", "Memory status",
+    "Clear memory", "Quit"
 };
 #define PALETTE_COUNT ((int)(sizeof(PALETTE_ITEMS) / sizeof(PALETTE_ITEMS[0])))
 
@@ -1159,6 +1466,32 @@ static void cmd_usage(void)
              used, total, total ? used * 100 / total : 0,
              g_usage.anonymous_requests, g_cfg.warn_pct, g_cfg.compact_pct);
     team_log_sys(&g_team, line);
+}
+
+static void cmd_memory(App *a)
+{
+    size_t local_msgs = 0;
+    for (size_t i = 0; i < a->n; i++) local_msgs += a->v[i].n;
+    char line[640];
+    snprintf(line, sizeof(line),
+             "memory: auto-save=on file=%s team_msgs=%zu local_msgs=%zu sessions=%zu summary=%zu bytes",
+             g_mem_path ? g_mem_path : "-", g_team.log.n, local_msgs, a->n,
+             g_team.summary ? strlen(g_team.summary) : 0);
+    team_log_sys(&g_team, line);
+    if (memory_save_now(a, &g_team) == 0) {
+        g_mem_dirty = 0;
+        g_mem_last_save = time(NULL);
+        team_log_sys(&g_team, "memory flushed to disk");
+    } else {
+        team_log_sys(&g_team, "memory flush failed");
+    }
+}
+
+static void cmd_clear_memory(App *a, int *team_mode)
+{
+    memory_clear(a, &g_team);
+    *team_mode = 1;
+    team_log_sys(&g_team, "chat memory cleared (auto-save remains on)");
 }
 
 static int run_command(App *a, Stream *st, int *team_mode, int *dirty,
@@ -1278,6 +1611,10 @@ static int run_command(App *a, Stream *st, int *team_mode, int *dirty,
         team_log_sys(&g_team, msg);
     } else if (strcmp(cmd, "usage") == 0) {
         cmd_usage();
+    } else if (strcmp(cmd, "memory") == 0) {
+        cmd_memory(a);
+    } else if (strcmp(cmd, "clearmemory") == 0 || strcmp(cmd, "forget") == 0) {
+        cmd_clear_memory(a, team_mode);
     } else if (strcmp(cmd, "compact") == 0) {
         compact_start(rest[0] ? rest : "manual /compact");
     } else if (strcmp(cmd, "rotate") == 0) {
@@ -1307,7 +1644,7 @@ static int run_command(App *a, Stream *st, int *team_mode, int *dirty,
         team_log_sys(&g_team,
             "/team /local /add NAME ROLE MODEL /rm NAME /focus NAME /sync /broadcast | "
             "/models /discover /model ID /smodel NAME MODEL /provider NAME /route URL /apikey KEY | "
-            "/local URL MODEL /usage /compact /rotate /threshold PCT /stub /save");
+            "/local URL MODEL /usage /memory /clearmemory /compact /rotate /threshold PCT /stub /save");
     } else if (strcmp(cmd, "new") == 0) {
         app_new_session(a);
         st->active = 0;
@@ -1325,8 +1662,8 @@ static int run_command(App *a, Stream *st, int *team_mode, int *dirty,
         *running = 0;
     } else if (strcmp(cmd, "help") == 0) {
         session_add(&a->v[a->cur],
-            "/new /next /clear /redraw /help /quit | /team /models /discover /usage /compact /stub",
-            strlen("/new /next /clear /redraw /help /quit | /team /models /discover /usage /compact /stub"),
+            "/new /next /clear /redraw /help /quit | /team /models /discover /usage /memory /clearmemory /compact /stub",
+            strlen("/new /next /clear /redraw /help /quit | /team /models /discover /usage /memory /clearmemory /compact /stub"),
             MSG_SYSTEM);
     } else {
         char msg[160];
@@ -1360,7 +1697,9 @@ static void palette_execute(int sel, App *a, Stream *st, int *team_mode,
         team_log_sys(&g_team, "config saved");
         break;
     }
-    case 10: *running = 0; break;
+    case 10: cmd_memory(a); *team_mode = 1; break;
+    case 11: cmd_clear_memory(a, team_mode); break;
+    case 12: *running = 0; break;
     default: break;
     }
     *dirty = 1;
@@ -1545,12 +1884,12 @@ static void render(App *a, Screen *s, Stream *st, int team_mode,
     walk_lines(view, width, render_cb, &lc);
 
     const char *status;
-    if (g_compact.active) status = " compacting transcript | feeding summary to next model | /teamhelp";
-    else if (g_run.active) status = " team running | synchronized round | Ctrl+T local | /teamhelp";
-    else if (team_mode) status = " team | /models /discover /usage /compact /stub | Ctrl+T local";
+    if (g_compact.active) status = " compacting transcript | memory auto-save | feeding summary to next model | /teamhelp";
+    else if (g_run.active) status = " team running | memory auto-save | synchronized round | Ctrl+T local | /teamhelp";
+    else if (team_mode) status = " team | memory auto-save | /models /discover /usage /compact /stub | Ctrl+T local";
     else status = st->active
-        ? " local-stub | streaming | Ctrl+T team | Ctrl+P commands | /help"
-        : " ready | Ctrl+T team | Ctrl+P commands | /help";
+        ? " local-stub | memory auto-save | streaming | Ctrl+T team | Ctrl+P commands | /help"
+        : " ready | memory auto-save | Ctrl+T team | Ctrl+P commands | /help";
     screen_text(s, 0, status_y, status, strlen(status), ST_STATUS);
 
     if (s->rows > 2) for (int x = 0; x < s->cols; x++) screen_put(s, x, status_y + 1, '-', ST_DIM);
@@ -1636,20 +1975,29 @@ int main(void)
         pool_set(ids, n);
     }
     team_init();
-    provider_reconfigure();
 
     App app;
     memset(&app, 0, sizeof(app));
     app_new_session(&app);
     Session *s0 = &app.v[0];
-    session_add(s0, "freecode: Kilo free gateway team, synchronized rounds, auto-compaction.",
-                strlen("freecode: Kilo free gateway team, synchronized rounds, auto-compaction."),
-                MSG_SYSTEM);
-    session_add(s0, "Type /team to join the team, /teamhelp for model/route/usage commands.",
-                strlen("Type /team to join the team, /teamhelp for model/route/usage commands."),
+    session_add(s0,
+        "freecode: Kilo free gateway team, synchronized rounds, auto-compaction, automatic chat memory.",
+        strlen("freecode: Kilo free gateway team, synchronized rounds, auto-compaction, automatic chat memory."),
+        MSG_SYSTEM);
+    session_add(s0, "Type /team to join the team, /teamhelp for model/route/usage/memory commands.",
+                strlen("Type /team to join the team, /teamhelp for model/route/usage/memory commands."),
                 MSG_SYSTEM);
     free(s0->title);
     s0->title = xstrdup("freecode");
+
+    /* Restore the previous conversation before configuring the provider so the
+     * saved focus model and full transcript are used immediately. */
+    g_mem_path = memory_default_path();
+    int mem_rc = memory_load(g_mem_path, &app, &g_team);
+    if (mem_rc < 0) team_log_sys(&g_team, "chat memory load failed; starting fresh");
+    g_mem_dirty = mem_rc < 0;
+    g_mem_last_save = time(NULL);
+    provider_reconfigure();
 
     Stream stream;
     memset(&stream, 0, sizeof(stream));
@@ -1690,6 +2038,7 @@ int main(void)
 
         struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
         int busy = g_compact.active || g_run.active || stream.active;
+        memory_save_if_dirty(&app, &g_team, 0);
         int r = poll(&pfd, 1, busy ? 12 : 40);
         if (r > 0 && (pfd.revents & POLLIN)) {
             char buf[256];
@@ -1707,11 +2056,14 @@ int main(void)
         }
     }
 
+    memory_save_if_dirty(&app, &g_team, 1);
+
     static const char leave_alt[] = "\033[0m\033[?1049l";
     write_all(STDOUT_FILENO, leave_alt, strlen(leave_alt));
     if (have_term) tcsetattr(STDIN_FILENO, TCSANOW, &orig);
 
     free(g_input);
+    free(g_mem_path);
     free(stream.target);
     run_reset();
     compact_reset();

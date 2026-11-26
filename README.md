@@ -101,6 +101,8 @@ the focused slot answers, but all slots still advance their sync cursor.
 | `/threshold PCT` | Set compaction threshold |
 | `/stub` | Toggle the offline streaming stub |
 | `/save` | Save config with mode `0600` |
+| `/memory` | Show memory file and restored message counts |
+| `/clearmemory` / `/forget` | Wipe saved memory and start a fresh transcript |
 | `/teamhelp` | Print all commands in the log |
 
 Local session commands still work: `/new`, `/next`, `/clear`, `/redraw`,
@@ -126,10 +128,32 @@ header at all. Explicit API keys are stored only in
 Environment overrides: `FREECODE_PROVIDER`, `FREECODE_BASE_URL`,
 `FREECODE_API_KEY`, `FREECODE_MODEL`, `FREECODE_FREE_ONLY`, `FREECODE_STUB`,
 `FREECODE_WARN_PCT`, `FREECODE_COMPACT_PCT`, `FREECODE_TEAM_SIZE`,
-`FREECODE_TRANSPORT`, plus the usual provider key variables.
+`FREECODE_TRANSPORT`, `FREECODE_MEMORY_FILE`, plus the usual provider key
+variables.
 
 `FREECODE_NO_DISCOVER=1` skips the startup catalog fetch and uses built-in free
 fallbacks. `FREECODE_STUB=1` starts fully offline.
+
+## Automatic chat memory
+
+Chat memory saves itself — you do not need to run a command to keep it.
+
+- Local sessions and the synchronized team log are written to a JSONL file
+  under `$XDG_STATE_HOME/freecode/memory.jsonl` (or
+  `~/.local/state/freecode/memory.jsonl`), mode `0600`.
+- Save happens automatically as messages arrive (throttled to at most once every
+  2 seconds) and again on exit, so closing the terminal keeps the conversation.
+- On startup the file is loaded before the provider is configured. The full
+  transcript, the compaction summary, slot models, focus, and broadcast mode are
+  restored. The restored log is fed into the next team request, so the agents
+  genuinely remember earlier turns instead of only redisplaying them.
+- Override the location with `FREECODE_MEMORY_FILE=/path/to/memory.jsonl`.
+- `/memory` reports the path and message counts and forces a flush.
+- `/clearmemory` (alias `/forget`) deletes the file and resets the in-memory
+  transcript. Auto-save stays on afterwards.
+
+The memory file contains chat text only. API keys are never written to it; they
+remain in the separate `0600` config file.
 
 ## Compaction and usage
 
@@ -163,6 +187,7 @@ full frontend stack. Use `/threshold`, `/compact`, and `/rotate` to control it.
 - OpenAI-compatible chat streaming and Anthropic native messages
 - Local models, custom routes, provider API keys
 - Token/cost/rate usage tracking, auto-compaction, model rotation
+- Automatic persistent chat memory with restored agent context
 
 ## Scope
 

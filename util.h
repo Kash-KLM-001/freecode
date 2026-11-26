@@ -24,6 +24,9 @@ void buf_fmt(Buf *b, const char *fmt, ...);
 void buf_free(Buf *b);
 char *buf_take(Buf *b);
 
+/* Create every parent directory of path (mode 0700), ignoring existing dirs. */
+int fs_mkdir_parents(const char *path);
+
 char *str_trim(char *s);
 int str_ends_with(const char *s, const char *suffix);
 int str_contains_ci(const char *s, const char *needle);
